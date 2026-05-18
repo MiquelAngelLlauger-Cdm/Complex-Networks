@@ -25,7 +25,7 @@ from bokeh.models import (
     Scatter,
     WMTSTileSource,
 )
-from bokeh.palettes import Category20, Turbo256
+from bokeh.palettes import Category20, Category10, Turbo256
 from bokeh.plotting import figure, from_networkx
 from bokeh.transform import factor_cmap
 
@@ -369,15 +369,13 @@ def _network_on_map(
         color_bar = ColorBar(color_mapper=mapper, ticker=BasicTicker(), label_standoff=8, title=colorbar_title)
         plot.add_layout(color_bar, "right")
 
-    network_graph.node_renderer.hover_glyph = Scatter(size="size", marker="circle", fill_color="white", line_color="black", line_width=1.8)
-    network_graph.node_renderer.selection_glyph = Scatter(size="size", marker="circle", fill_color="white", line_color="black", line_width=1.8)
+    # avoid hover/selection glyph overrides so JS-driven colors remain visible
 
     network_graph.edge_renderer.glyph = MultiLine(line_alpha=0.12, line_width=1.0, line_color="gray")
     network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
     network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
 
-    network_graph.selection_policy = NodesAndLinkedEdges()
-    network_graph.inspection_policy = NodesAndLinkedEdges()
+    # do not rely on Bokeh's NodesAndLinkedEdges here; JS manages highlighting
 
     plot.renderers.append(network_graph)
     _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=node_size)
@@ -570,8 +568,18 @@ def _communities_to_mapping(communities):
 
 
 def _community_palette(count: int):
+    if count <= 0:
+        return []
+    if count == 1:
+        return [Category10[3][0]]
+    if count == 2:
+        # use a red/green pair for clear contrast
+        return ["#e41a1c", "#4daf4a"]
+    if count <= 3:
+        return Category10[3][:count]
     if count <= 10:
-        return Category20[10][:count]
+        # Category10 provides a distinct qualitative palette for up to 10 categories
+        return Category10[10][:count]
     if count <= 20:
         return Category20[20][:count]
     return [Turbo256[int(i)] for i in np.linspace(0, len(Turbo256) - 1, count).astype(int)]
@@ -613,6 +621,9 @@ def _plot_community_map(
     node_source.data["role"] = labels
     # ensure index mapping exists (node ids) for JS
     node_source.data["index"] = list(sampled.nodes())
+    # ensure x/y present for direct access from JS
+    node_source.data["x"] = [pos[n][0] for n in sampled.nodes()]
+    node_source.data["y"] = [pos[n][1] for n in sampled.nodes()]
     node_source.data["color"] = colors
     node_source.data["orig_color"] = list(colors)
     node_source.data["size_base"] = [node_size for _ in sampled.nodes()]
@@ -719,12 +730,182 @@ def _plot_community_map(
     hover = HoverTool(tooltips=[("Airport", "@name"), ("Community", "@community"), ("Degree", "@degree")], renderers=[network_graph.node_renderer], mode='mouse')
     plot.add_tools(hover)
 
-    # Attach callback to the inspected indices (hover) so it fires reliably across Bokeh versions
+    # Robust interaction: compute nearest node from mouse position and highlight its community.
+    mouse_callback = CustomJS(
+        args=dict(node_source=node_source, edge_source=edge_source, x_range=plot.x_range, y_range=plot.y_range),
+        code="""
+        const ns = node_source.data;
+        const es = edge_source.data;
+        const mx = cb_obj.x;
+        const my = cb_obj.y;
+        const N = (ns['x'] || []).length;
+        if (N === 0) { return; }
+
+        // squared distance threshold based on current view
+        const x_span = x_range.end - x_range.start;
+        const threshold = Math.pow(x_span / 80.0, 2);
+
+        // find nearest node
+        let minD = Infinity;
+        let minIdx = -1;
+        for (let i = 0; i < N; i++) {
+            const dx = ns['x'][i] - mx;
+            const dy = ns['y'][i] - my;
+            const d = dx * dx + dy * dy;
+            if (d < minD) { minD = d; minIdx = i; }
+        }
+
+        function reset_all(){
+            for (let i = 0; i < N; i++){
+                ns['alpha'][i] = 0.9;
+                ns['size'][i] = ns['size_base'][i];
+                ns['color'][i] = ns['orig_color'][i];
+            }
+            for (let j = 0; j < (es['start'] || []).length; j++){
+                es['line_alpha'][j] = 0.12;
+                es['line_color'][j] = 'gray';
+            }
+        }
+
+        if (minD > threshold) {
+            reset_all();
+            node_source.change.emit();
+            edge_source.change.emit();
+            console.log('community-mousemove: no node within threshold')
+            return;
+        }
+
+        // highlight community of nearest node
+        const target_comm = ns['community'][minIdx];
+        for (let i = 0; i < N; i++){
+            if (ns['community'][i] === target_comm){
+                ns['alpha'][i] = 0.95;
+                ns['size'][i] = ns['size_base'][i] * 1.6;
+                ns['color'][i] = ns['orig_color'][i];
+            } else {
+                ns['alpha'][i] = 0.15;
+                ns['size'][i] = ns['size_base'][i];
+                ns['color'][i] = ns['orig_color'][i];
+            }
+        }
+        for (let j = 0; j < (es['start'] || []).length; j++){
+            const s = es['start'][j];
+            const t = es['end'][j];
+            const s_comm = ns['community'][ ns['index'].indexOf(s) ];
+            const t_comm = ns['community'][ ns['index'].indexOf(t) ];
+            if (s_comm === target_comm && t_comm === target_comm){
+                es['line_alpha'][j] = 0.9;
+                es['line_color'][j] = ns['orig_color'][ ns['index'].indexOf(s) ] || 'black';
+            } else {
+                es['line_alpha'][j] = 0.12;
+                es['line_color'][j] = 'gray';
+            }
+        }
+
+        console.log('community-mousemove: highlight', minIdx, target_comm)
+        node_source.change.emit();
+        edge_source.change.emit();
+        """,
+    )
+
+    leave_callback = CustomJS(
+        args=dict(node_source=node_source, edge_source=edge_source),
+        code="""
+        const ns = node_source.data;
+        const es = edge_source.data;
+        const N = (ns['community'] || []).length;
+        for (let i = 0; i < N; i++){
+            ns['alpha'][i] = 0.9;
+            ns['size'][i] = ns['size_base'][i];
+            ns['color'][i] = ns['orig_color'][i];
+        }
+        for (let j = 0; j < (es['start'] || []).length; j++){
+            es['line_alpha'][j] = 0.12;
+            es['line_color'][j] = 'gray';
+        }
+        console.log('community-mouseleave: reset')
+        node_source.change.emit();
+        edge_source.change.emit();
+        """,
+    )
+
+    plot.js_on_event('mousemove', mouse_callback)
+    plot.js_on_event('mouseleave', leave_callback)
+
+    # selection (tap) callback: highlight community when a node is selected (click)
+    selection_callback = CustomJS(
+        args=dict(node_source=node_source, edge_source=edge_source),
+        code="""
+        const ns = node_source.data;
+        const es = edge_source.data;
+        const sel = node_source.selected ? node_source.selected.indices : [];
+        const N = (ns['community'] || []).length;
+
+        function reset_all(){
+            for (let i = 0; i < N; i++){
+                ns['alpha'][i] = 0.9;
+                ns['size'][i] = ns['size_base'][i];
+                ns['color'][i] = ns['orig_color'][i];
+            }
+            for (let j = 0; j < (es['start'] || []).length; j++){
+                es['line_alpha'][j] = 0.12;
+                es['line_color'][j] = 'gray';
+            }
+        }
+
+        if (!sel || sel.length === 0) {
+            reset_all();
+        } else {
+            // expand selection to full community
+            const pick = sel[0];
+            const target_comm = ns['community'][pick];
+            const matched = [];
+            for (let i = 0; i < N; i++){
+                if (ns['community'][i] === target_comm) matched.push(i);
+            }
+            // set the selected indices to the whole community
+            if (node_source.selected) {
+                node_source.selected.indices = matched;
+            }
+
+            reset_all();
+            for (let i = 0; i < N; i++){
+                if (ns['community'][i] === target_comm){
+                    ns['alpha'][i] = 0.95;
+                    ns['size'][i] = ns['size_base'][i] * 1.6;
+                    ns['color'][i] = ns['orig_color'][i];
+                } else {
+                    ns['alpha'][i] = 0.15;
+                    ns['size'][i] = ns['size_base'][i];
+                    ns['color'][i] = ns['orig_color'][i];
+                }
+            }
+            for (let j = 0; j < (es['start'] || []).length; j++){
+                const s = es['start'][j];
+                const t = es['end'][j];
+                const s_idx = ns['index'].indexOf(s);
+                const t_idx = ns['index'].indexOf(t);
+                const s_comm = s_idx >= 0 ? ns['community'][s_idx] : null;
+                const t_comm = t_idx >= 0 ? ns['community'][t_idx] : null;
+                if (s_comm === target_comm && t_comm === target_comm){
+                    es['line_alpha'][j] = 0.9;
+                    es['line_color'][j] = ns['orig_color'][s_idx] || 'black';
+                } else {
+                    es['line_alpha'][j] = 0.12;
+                    es['line_color'][j] = 'gray';
+                }
+            }
+        }
+
+        node_source.change.emit();
+        edge_source.change.emit();
+        """,
+    )
+
     try:
-        node_source.inspected.js_on_change('indices', callback)
+        node_source.selected.js_on_change('indices', selection_callback)
     except Exception:
-        # fallback to selected if inspected isn't available in this Bokeh version
-        node_source.selected.js_on_change('indices', callback)
+        pass
 
     plot.renderers.append(network_graph)
     _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=node_size)
