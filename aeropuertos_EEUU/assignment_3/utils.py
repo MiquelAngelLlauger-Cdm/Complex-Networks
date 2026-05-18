@@ -25,7 +25,7 @@ from bokeh.models import (
     Scatter,
     WMTSTileSource,
 )
-from bokeh.palettes import Category20, Category10, Turbo256
+from bokeh.palettes import Category20, Category10, Turbo256, Viridis256
 from bokeh.plotting import figure, from_networkx
 from bokeh.transform import factor_cmap
 
@@ -254,7 +254,12 @@ def _base_figure(title: str, pos: Dict[int, Tuple[float, float]], tooltips: List
     return plot
 
 
-def _attach_zoom_scaling(plot, source, base_size: int, min_size: int = 8, max_size: int = 26):
+_CENTER_PERIPHERY_FACTORS = ["center", "periphery", "other"]
+_CENTER_PERIPHERY_PALETTE = ["#d62728", "#1f77b4", "#9e9e9e"]
+_CENTER_PERIPHERY_LABELS = ["Center", "Periphery", "Other"]
+
+
+def _attach_zoom_scaling(plot, source, base_size: int, min_size: int = 6, max_size: int = 20):
     initial_x_span = float(plot.x_range.end - plot.x_range.start)
     initial_y_span = float(plot.y_range.end - plot.y_range.start)
 
@@ -276,6 +281,86 @@ def _attach_zoom_scaling(plot, source, base_size: int, min_size: int = 8, max_si
     plot.y_range.js_on_change("start", callback)
     plot.y_range.js_on_change("end", callback)
     callback.code = callback.code
+
+
+def _attach_incident_edge_highlighting(plot, network_graph, pos: Dict[int, Tuple[float, float]]):
+    """Highlight edges incident to the node under the cursor (network map plots only)."""
+    node_source = network_graph.node_renderer.data_source
+    edge_source = network_graph.edge_renderer.data_source
+
+    node_ids = node_source.data.get("index", list(pos.keys()))
+    node_source.data["x"] = [pos[n][0] for n in node_ids]
+    node_source.data["y"] = [pos[n][1] for n in node_ids]
+
+    n_edges = len(edge_source.data.get("start", []))
+    edge_source.data["line_alpha"] = [0.12] * n_edges
+    edge_source.data["line_color"] = ["gray"] * n_edges
+
+    network_graph.edge_renderer.glyph = MultiLine(line_alpha="line_alpha", line_width=1.0, line_color="line_color")
+    network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+    network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+
+    mouse_callback = CustomJS(
+        args=dict(node_source=node_source, edge_source=edge_source, x_range=plot.x_range, y_range=plot.y_range),
+        code="""
+        const ns = node_source.data;
+        const es = edge_source.data;
+        const mx = cb_obj.x;
+        const my = cb_obj.y;
+        const N = (ns['x'] || []).length;
+        if (N === 0) { return; }
+
+        const x_span = x_range.end - x_range.start;
+        const threshold = Math.pow(x_span / 80.0, 2);
+
+        let minD = Infinity;
+        let minIdx = -1;
+        for (let i = 0; i < N; i++) {
+            const dx = ns['x'][i] - mx;
+            const dy = ns['y'][i] - my;
+            const d = dx * dx + dy * dy;
+            if (d < minD) { minD = d; minIdx = i; }
+        }
+
+        function reset_edges() {
+            for (let j = 0; j < (es['start'] || []).length; j++) {
+                es['line_alpha'][j] = 0.12;
+                es['line_color'][j] = 'gray';
+            }
+        }
+
+        if (minD > threshold) {
+            reset_edges();
+            edge_source.change.emit();
+            return;
+        }
+
+        const node_id = ns['index'][minIdx];
+        reset_edges();
+        for (let j = 0; j < (es['start'] || []).length; j++) {
+            if (es['start'][j] === node_id || es['end'][j] === node_id) {
+                es['line_alpha'][j] = 0.95;
+                es['line_color'][j] = '#111111';
+            }
+        }
+        edge_source.change.emit();
+        """,
+    )
+
+    leave_callback = CustomJS(
+        args=dict(edge_source=edge_source),
+        code="""
+        const es = edge_source.data;
+        for (let j = 0; j < (es['start'] || []).length; j++) {
+            es['line_alpha'][j] = 0.12;
+            es['line_color'][j] = 'gray';
+        }
+        edge_source.change.emit();
+        """,
+    )
+
+    plot.js_on_event("mousemove", mouse_callback)
+    plot.js_on_event("mouseleave", leave_callback)
 
 
 def _prepare_node_attributes(
@@ -326,12 +411,13 @@ def _network_on_map(
     graph: nx.Graph,
     title: str,
     max_edges: int = 1500,
-    node_size: int = 10,
+    node_size: int = 8,
     edge_alpha: float = 0.35,
     node_value: Dict[int, float] | None = None,
     roles: Dict[int, str] | None = None,
     colorbar_title: str = "Value",
     node_palette=Turbo256,
+    categorical_coloring: bool = False,
     edge_color: str = "gray",
     directed_arrows: bool = False,
 ):
@@ -339,13 +425,34 @@ def _network_on_map(
     _prepare_node_attributes(sampled, graph, values=node_value, roles=roles)
 
     pos = _positions(sampled)
-    plot = _base_figure(title, pos, tooltips=_node_tooltips(graph, show_value=node_value is not None, show_role=roles is not None))
+    plot = _base_figure(
+        title,
+        pos,
+        tooltips=_node_tooltips(
+            graph,
+            show_value=node_value is not None and not categorical_coloring,
+            show_role=roles is not None,
+        ),
+    )
 
     network_graph = from_networkx(sampled, pos)
     network_graph.node_renderer.data_source.data["size_base"] = [node_size for _ in sampled.nodes()]
     network_graph.node_renderer.data_source.data["size"] = [node_size for _ in sampled.nodes()]
 
-    if node_value is None:
+    if categorical_coloring and roles is not None:
+        network_graph.node_renderer.glyph = Scatter(
+            size="size",
+            marker="circle",
+            fill_color=factor_cmap("role", palette=_CENTER_PERIPHERY_PALETTE, factors=_CENTER_PERIPHERY_FACTORS),
+            line_color="white",
+            fill_alpha=0.9,
+        )
+        for label, color in zip(_CENTER_PERIPHERY_LABELS, _CENTER_PERIPHERY_PALETTE):
+            plot.scatter([], [], legend_label=label, fill_color=color, line_color="white", size=node_size)
+        plot.legend.location = "top_right"
+        plot.legend.click_policy = "hide"
+        plot.legend.background_fill_alpha = 0.85
+    elif node_value is None:
         network_graph.node_renderer.glyph = Scatter(
             size="size",
             marker="circle",
@@ -369,15 +476,12 @@ def _network_on_map(
         color_bar = ColorBar(color_mapper=mapper, ticker=BasicTicker(), label_standoff=8, title=colorbar_title)
         plot.add_layout(color_bar, "right")
 
-    # avoid hover/selection glyph overrides so JS-driven colors remain visible
-
     network_graph.edge_renderer.glyph = MultiLine(line_alpha=0.12, line_width=1.0, line_color="gray")
     network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
     network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
 
-    # do not rely on Bokeh's NodesAndLinkedEdges here; JS manages highlighting
-
     plot.renderers.append(network_graph)
+    _attach_incident_edge_highlighting(plot, network_graph, pos)
     _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=node_size)
 
     if directed_arrows and sampled.is_directed():
@@ -403,7 +507,7 @@ def plot_all_connections(graph: nx.DiGraph, max_edges: int = 300):
         graph,
         title=f"All Airports and Connections (Nodes={graph.number_of_nodes()}, Edges={graph.number_of_edges()})",
         max_edges=max_edges,
-        node_size=14,
+        node_size=10,
         directed_arrows=True,
     )
 
@@ -413,7 +517,7 @@ def plot_one_way_connections(graph_one_way: nx.DiGraph, max_edges: int = 500):
         graph_one_way,
         title="One-Way Airport Connections",
         max_edges=max_edges,
-        node_size=14,
+        node_size=10,
         directed_arrows=True,
     )
 
@@ -426,7 +530,7 @@ def plot_one_way_degree_diff(graph_one_way: nx.DiGraph, max_edges: int = 500):
         max_edges=max_edges,
         node_value=degree_diffs,
         colorbar_title="In - Out",
-        node_size=14,
+        node_size=10,
         directed_arrows=True,
     )
 
@@ -436,7 +540,7 @@ def plot_two_way_connections(graph_undirected: nx.Graph, max_edges: int = 500):
         graph_undirected,
         title=f"Bidirectional Airport Connections (Nodes={graph_undirected.number_of_nodes()}, Edges={graph_undirected.number_of_edges()})",
         max_edges=max_edges,
-        node_size=14,
+        node_size=10,
         directed_arrows=False,
     )
 
@@ -451,7 +555,8 @@ def plot_centrality_grid(graph_undirected: nx.Graph, max_edges_each: int = 600):
             max_edges=max_edges_each,
             node_value=values,
             colorbar_title=title,
-            node_size=13,
+            node_palette=Viridis256,
+            node_size=9,
             directed_arrows=False,
         )
         figures.append(fig)
@@ -483,7 +588,8 @@ def plot_local_clustering_map(graph_undirected: nx.Graph, max_edges: int = 1200)
         max_edges=max_edges,
         node_value=coeff,
         colorbar_title="Clustering",
-        node_size=13,
+        node_palette=Viridis256,
+        node_size=9,
         directed_arrows=False,
     )
 
@@ -499,27 +605,22 @@ def plot_center_periphery(graph_undirected: nx.Graph, max_edges: int = 1200):
     center_nodes = set(nx.center(g_lcc))
     periphery_nodes = set(nx.periphery(g_lcc))
 
-    values = {}
     roles = {}
     for n in g_lcc.nodes():
         if n in center_nodes:
-            values[n] = 2.0
             roles[n] = "center"
         elif n in periphery_nodes:
-            values[n] = 1.0
             roles[n] = "periphery"
         else:
-            values[n] = 0.0
             roles[n] = "other"
 
     fig = _network_on_map(
         g_lcc,
-        title="Center (2), Periphery (1), Other (0) - Largest Connected Component",
+        title="Center, Periphery, and Other — Largest Connected Component",
         max_edges=max_edges,
-        node_value=values,
         roles=roles,
-        colorbar_title="Role",
-        node_size=13,
+        categorical_coloring=True,
+        node_size=9,
         directed_arrows=False,
     )
     return fig
@@ -591,7 +692,7 @@ def _plot_community_map(
     title: str,
     modularity_score: float,
     max_edges: int = 1200,
-    node_size: int = 13,
+    node_size: int = 9,
 ):
     community_membership = _communities_to_mapping(communities)
     sampled = _subsample_graph_edges(graph, max_edges=max_edges)
