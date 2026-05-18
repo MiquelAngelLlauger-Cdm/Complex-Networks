@@ -1042,28 +1042,46 @@ def louvain_communities_plot(graph_undirected: nx.Graph, max_edges: int = 1200):
     return _plot_community_map(graph_undirected, communities, "Louvain Communities", score, max_edges=max_edges)
 
 
+def _igraph_networkx_node_ids(ig_graph) -> List:
+    """Map igraph vertices back to the original NetworkX node identifiers."""
+    if "_nx_name" in ig_graph.vs.attributes():
+        return list(ig_graph.vs["_nx_name"])
+    if "name" in ig_graph.vs.attributes():
+        return list(ig_graph.vs["name"])
+    return list(range(ig_graph.vcount()))
+
+
+def _membership_to_communities(node_ids: List, membership: Iterable[int]) -> List[set]:
+    buckets: Dict[int, set] = {}
+    for node_id, community_index in zip(node_ids, membership):
+        buckets.setdefault(int(community_index), set()).add(node_id)
+    return [members for members in buckets.values() if members]
+
+
 def leiden_communities_plot(graph_undirected: nx.Graph, max_edges: int = 1200):
     if ig is not None:
         ig_graph = ig.Graph.from_networkx(graph_undirected)
-        vertex_names = ig_graph.vs["name"]
+        node_ids = _igraph_networkx_node_ids(ig_graph)
+        leiden_kwargs = {"objective_function": "modularity"}
+        partition_kwargs = {}
+        if "weight" in ig_graph.es.attributes():
+            leiden_kwargs["weights"] = "weight"
+            partition_kwargs["weights"] = "weight"
+
         if hasattr(ig_graph, "community_leiden"):
-            partition = ig_graph.community_leiden(objective_function="modularity")
-            communities = []
-            for community_index in range(len(partition)):
-                members = {name for name, membership in zip(vertex_names, partition.membership) if membership == community_index}
-                if members:
-                    communities.append(members)
-            score = partition.modularity
+            partition = ig_graph.community_leiden(**leiden_kwargs)
+            communities = _membership_to_communities(node_ids, partition.membership)
+            score = float(partition.modularity)
             return _plot_community_map(graph_undirected, communities, "Leiden Communities", score, max_edges=max_edges)
 
         if leidenalg is not None:
-            partition = leidenalg.find_partition(ig_graph, leidenalg.ModularityVertexPartition)
-            communities = []
-            for community_index in range(len(partition)):
-                members = {name for name, membership in zip(vertex_names, partition.membership) if membership == community_index}
-                if members:
-                    communities.append(members)
-            score = partition.modularity
+            partition = leidenalg.find_partition(
+                ig_graph,
+                leidenalg.ModularityVertexPartition,
+                **partition_kwargs,
+            )
+            communities = _membership_to_communities(node_ids, partition.membership)
+            score = float(partition.modularity)
             return _plot_community_map(graph_undirected, communities, "Leiden Communities", score, max_edges=max_edges)
 
     print("Warning: Leiden algorithm not available, falling back to Louvain communities.")
