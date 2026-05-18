@@ -25,8 +25,21 @@ from bokeh.models import (
     Scatter,
     WMTSTileSource,
 )
-from bokeh.palettes import Turbo256
+from bokeh.palettes import Category20, Turbo256
 from bokeh.plotting import figure, from_networkx
+from bokeh.transform import factor_cmap
+
+try:
+    import igraph as ig
+except Exception:  # pragma: no cover - optional dependency
+    ig = None
+
+try:
+    import leidenalg
+except Exception:  # pragma: no cover - optional dependency
+    leidenalg = None
+
+from networkx.algorithms.community import girvan_newman, louvain_communities, modularity
 
 
 @dataclass
@@ -546,6 +559,246 @@ def plot_degree_distribution_loglog(graph_undirected: nx.Graph, add_fit: bool = 
     fig.xaxis.axis_label = "k"
     fig.yaxis.axis_label = "P(k)"
     return fig
+
+
+def _communities_to_mapping(communities):
+    community_membership = {}
+    for index, community in enumerate(communities, start=1):
+        for node in community:
+            community_membership[node] = f"Community {index}"
+    return community_membership
+
+
+def _community_palette(count: int):
+    if count <= 10:
+        return Category20[10][:count]
+    if count <= 20:
+        return Category20[20][:count]
+    return [Turbo256[int(i)] for i in np.linspace(0, len(Turbo256) - 1, count).astype(int)]
+
+
+def _plot_community_map(
+    graph: nx.Graph,
+    communities,
+    title: str,
+    modularity_score: float,
+    max_edges: int = 1200,
+    node_size: int = 13,
+):
+    community_membership = _communities_to_mapping(communities)
+    sampled = _subsample_graph_edges(graph, max_edges=max_edges)
+    _prepare_node_attributes(sampled, graph, roles={n: community_membership.get(n, "Community 0") for n in sampled.nodes()})
+
+    pos = _positions(sampled)
+    plot = _base_figure(
+        title,
+        pos,
+        tooltips=[("Airport", "@name"), ("Community", "@role"), ("Degree", "@degree")],
+    )
+
+    network_graph = from_networkx(sampled, pos)
+    labels = [community_membership.get(node, "Community 0") for node in sampled.nodes()]
+    factors = sorted(set(labels))
+    palette = _community_palette(len(factors))
+
+    # assign a color per community (categorical)
+    color_map = {f: palette[i % len(palette)] for i, f in enumerate(factors)}
+    colors = [color_map[l] for l in labels]
+
+    node_source = network_graph.node_renderer.data_source
+    edge_source = network_graph.edge_renderer.data_source
+
+    node_source.data["community"] = labels
+    # expose 'role' for existing tooltips compatibility
+    node_source.data["role"] = labels
+    # ensure index mapping exists (node ids) for JS
+    node_source.data["index"] = list(sampled.nodes())
+    node_source.data["color"] = colors
+    node_source.data["orig_color"] = list(colors)
+    node_source.data["size_base"] = [node_size for _ in sampled.nodes()]
+    node_source.data["size"] = [node_size for _ in sampled.nodes()]
+    node_source.data["alpha"] = [0.9 for _ in sampled.nodes()]
+
+    # use per-node color and alpha so we can update them from JS on hover
+    network_graph.node_renderer.glyph = Scatter(
+        size="size",
+        marker="circle",
+        fill_color="color",
+        line_color="white",
+        fill_alpha="alpha",
+    )
+    network_graph.node_renderer.hover_glyph = Scatter(size="size", marker="circle", fill_color="white", line_color="black", line_width=1.8)
+    network_graph.node_renderer.selection_glyph = Scatter(size="size", marker="circle", fill_color="white", line_color="black", line_width=1.8)
+
+    # prepare edge columns for JS-driven highlighting
+    n_edges = len(edge_source.data.get("start", []))
+    edge_source.data.setdefault("line_alpha", [0.12] * n_edges)
+    edge_source.data.setdefault("line_color", ["gray"] * n_edges)
+
+    network_graph.edge_renderer.glyph = MultiLine(line_alpha="line_alpha", line_width=1.0, line_color="line_color")
+    network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+    network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+
+    network_graph.selection_policy = NodesAndLinkedEdges()
+    network_graph.inspection_policy = NodesAndLinkedEdges()
+
+    # JS callback: when hovering a node, highlight all nodes and intra-community edges
+    callback = CustomJS(
+        args=dict(node_source=node_source, edge_source=edge_source),
+        code="""
+        const ns = node_source.data;
+        const es = edge_source.data;
+        // get hovered indices from inspected (hover) or selected (fallback)
+        const inspected = (node_source.inspected && node_source.inspected.indices) ? node_source.inspected.indices : (node_source.selected ? node_source.selected.indices : []);
+        const N = (ns['community'] || []).length;
+        const ids = ns['index'] || [];
+
+        // build id -> community and id -> orig_color maps
+        const id2comm = {};
+        const id2orig = {};
+        for (let i = 0; i < N; i++) {
+            const id = ids[i];
+            id2comm[id] = ns['community'][i];
+            id2orig[id] = ns['orig_color'][i];
+        }
+
+        // reset helpers
+        function reset_all(){
+            for (let i = 0; i < N; i++){
+                ns['alpha'][i] = 0.9;
+                ns['size'][i] = ns['size_base'][i];
+                ns['color'][i] = ns['orig_color'][i];
+            }
+            for (let j = 0; j < (es['start'] || []).length; j++){
+                es['line_alpha'][j] = 0.12;
+                es['line_color'][j] = 'gray';
+            }
+        }
+
+        if (!inspected || inspected.length === 0) {
+            reset_all();
+        } else {
+            reset_all();
+            const pick = inspected[0];
+            const target_comm = ns['community'][pick];
+            // highlight nodes in community
+            for (let i = 0; i < N; i++){
+                if (ns['community'][i] === target_comm){
+                    ns['alpha'][i] = 0.95;
+                    ns['size'][i] = ns['size_base'][i] * 1.6;
+                    ns['color'][i] = ns['orig_color'][i];
+                } else {
+                    ns['alpha'][i] = 0.15;
+                    ns['size'][i] = ns['size_base'][i];
+                    // keep original color but dim via alpha
+                    ns['color'][i] = ns['orig_color'][i];
+                }
+            }
+            // highlight intra-community edges
+            for (let j = 0; j < (es['start'] || []).length; j++){
+                const s = es['start'][j];
+                const t = es['end'][j];
+                const s_comm = id2comm[s];
+                const t_comm = id2comm[t];
+                if (s_comm === target_comm && t_comm === target_comm){
+                    es['line_alpha'][j] = 0.9;
+                    es['line_color'][j] = id2orig[s] || 'black';
+                } else {
+                    es['line_alpha'][j] = 0.12;
+                    es['line_color'][j] = 'gray';
+                }
+            }
+        }
+
+        node_source.change.emit();
+        edge_source.change.emit();
+        """,
+    )
+
+
+    hover = HoverTool(tooltips=[("Airport", "@name"), ("Community", "@community"), ("Degree", "@degree")], renderers=[network_graph.node_renderer], mode='mouse')
+    plot.add_tools(hover)
+
+    # Attach callback to the inspected indices (hover) so it fires reliably across Bokeh versions
+    try:
+        node_source.inspected.js_on_change('indices', callback)
+    except Exception:
+        # fallback to selected if inspected isn't available in this Bokeh version
+        node_source.selected.js_on_change('indices', callback)
+
+    plot.renderers.append(network_graph)
+    _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=node_size)
+    return plot, modularity_score
+
+
+def louvain_communities_plot(graph_undirected: nx.Graph, max_edges: int = 1200):
+    communities = louvain_communities(graph_undirected, seed=42, weight="weight")
+    score = modularity(graph_undirected, communities, weight="weight")
+    return _plot_community_map(graph_undirected, communities, "Louvain Communities", score, max_edges=max_edges)
+
+
+def leiden_communities_plot(graph_undirected: nx.Graph, max_edges: int = 1200):
+    if ig is not None:
+        ig_graph = ig.Graph.from_networkx(graph_undirected)
+        vertex_names = ig_graph.vs["name"]
+        if hasattr(ig_graph, "community_leiden"):
+            partition = ig_graph.community_leiden(objective_function="modularity")
+            communities = []
+            for community_index in range(len(partition)):
+                members = {name for name, membership in zip(vertex_names, partition.membership) if membership == community_index}
+                if members:
+                    communities.append(members)
+            score = partition.modularity
+            return _plot_community_map(graph_undirected, communities, "Leiden Communities", score, max_edges=max_edges)
+
+        if leidenalg is not None:
+            partition = leidenalg.find_partition(ig_graph, leidenalg.ModularityVertexPartition)
+            communities = []
+            for community_index in range(len(partition)):
+                members = {name for name, membership in zip(vertex_names, partition.membership) if membership == community_index}
+                if members:
+                    communities.append(members)
+            score = partition.modularity
+            return _plot_community_map(graph_undirected, communities, "Leiden Communities", score, max_edges=max_edges)
+
+    print("Warning: Leiden algorithm not available, falling back to Louvain communities.")
+    fallback_communities = louvain_communities(graph_undirected, seed=42, weight="weight")
+    fallback_score = modularity(graph_undirected, fallback_communities, weight="weight")
+    return _plot_community_map(
+        graph_undirected,
+        fallback_communities,
+        "Leiden Communities (fallback partition)",
+        fallback_score,
+        max_edges=max_edges,
+    )
+
+
+def girvan_newman_communities_plot(graph_undirected: nx.Graph, max_edges: int = 1200, max_levels: int = 6):
+    best_partition = None
+    best_score = -1.0
+    best_communities = None
+
+    for level, partition in enumerate(girvan_newman(graph_undirected), start=1):
+        communities = [set(group) for group in partition]
+        score = modularity(graph_undirected, communities)
+        if score > best_score:
+            best_score = score
+            best_partition = level
+            best_communities = communities
+        if level >= max_levels:
+            break
+
+    if best_communities is None:
+        best_communities = [set(graph_undirected.nodes())]
+        best_score = 0.0
+
+    return _plot_community_map(
+        graph_undirected,
+        best_communities,
+        f"Girvan-Newman Communities (best level {best_partition or 1})",
+        best_score,
+        max_edges=max_edges,
+    )
 
 
 def run_pipeline(config: AirportDatasetConfig):
