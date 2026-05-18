@@ -259,6 +259,33 @@ _CENTER_PERIPHERY_PALETTE = ["#d62728", "#1f77b4", "#9e9e9e"]
 _CENTER_PERIPHERY_LABELS = ["Center", "Periphery", "Other"]
 
 
+def _add_categorical_legend(plot, labels: List[str], colors: List[str], marker_size: int):
+    """Add a legend with visible color markers (empty scatters omit swatches in Bokeh)."""
+    x_span = float(plot.x_range.end - plot.x_range.start)
+    y_span = float(plot.y_range.end - plot.y_range.start)
+    legend_x = float(plot.x_range.start) - x_span
+    legend_y = float(plot.y_range.start) - y_span
+
+    for label, color in zip(labels, colors):
+        plot.scatter(
+            [legend_x],
+            [legend_y],
+            legend_label=label,
+            fill_color=color,
+            line_color="white",
+            size=marker_size,
+            fill_alpha=0.9,
+        )
+
+    if plot.legend is not None:
+        plot.legend.location = "top_right"
+        plot.legend.click_policy = "hide"
+        plot.legend.background_fill_alpha = 0.85
+        plot.legend.label_text_font_size = "10pt"
+        plot.legend.glyph_width = 18
+        plot.legend.glyph_height = 18
+
+
 def _attach_zoom_scaling(plot, source, base_size: int, min_size: int = 6, max_size: int = 20):
     initial_x_span = float(plot.x_range.end - plot.x_range.start)
     initial_y_span = float(plot.y_range.end - plot.y_range.start)
@@ -447,11 +474,7 @@ def _network_on_map(
             line_color="white",
             fill_alpha=0.9,
         )
-        for label, color in zip(_CENTER_PERIPHERY_LABELS, _CENTER_PERIPHERY_PALETTE):
-            plot.scatter([], [], legend_label=label, fill_color=color, line_color="white", size=node_size)
-        plot.legend.location = "top_right"
-        plot.legend.click_policy = "hide"
-        plot.legend.background_fill_alpha = 0.85
+        _add_categorical_legend(plot, _CENTER_PERIPHERY_LABELS, _CENTER_PERIPHERY_PALETTE, node_size)
     elif node_value is None:
         network_graph.node_renderer.glyph = Scatter(
             size="size",
