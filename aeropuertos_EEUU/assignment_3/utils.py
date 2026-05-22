@@ -1124,6 +1124,276 @@ def girvan_newman_communities_plot(graph_undirected: nx.Graph, max_edges: int = 
     )
 
 
+# ─── Dynamics: Random Walk ────────────────────────────────────────────────────
+
+def simulate_random_walk(
+    graph: nx.DiGraph,
+    n_steps: int = 200_000,
+    restart_prob: float = 0.15,
+    seed: int = 42,
+) -> Dict[int, float]:
+    """Random walk with teleportation on a directed graph; returns normalised visit frequencies."""
+    rng = np.random.default_rng(seed)
+    nodes = list(graph.nodes())
+    n = len(nodes)
+    adj = {v: list(graph.successors(v)) for v in nodes}
+    node_to_idx = {v: i for i, v in enumerate(nodes)}
+    visit = np.zeros(n, dtype=np.int64)
+
+    current = nodes[int(rng.integers(n))]
+    for _ in range(n_steps):
+        visit[node_to_idx[current]] += 1
+        if rng.random() < restart_prob or not adj[current]:
+            current = nodes[int(rng.integers(n))]
+        else:
+            nbrs = adj[current]
+            current = nbrs[int(rng.integers(len(nbrs)))]
+
+    freq = visit / n_steps
+    return {v: float(freq[node_to_idx[v]]) for v in nodes}
+
+
+def compute_mixing_time_tvd(
+    graph: nx.DiGraph,
+    start_node=None,
+    damping: float = 0.85,
+    epsilon: float = 0.05,
+    max_steps: int = 25,
+) -> Tuple[np.ndarray, int]:
+    """
+    Power-iterate the PageRank transition matrix starting from a delta distribution.
+    Returns (tvd_per_step, first_step_where_tvd < epsilon).
+    """
+    nodes = list(graph.nodes())
+    n = len(nodes)
+    node_to_idx = {v: i for i, v in enumerate(nodes)}
+
+    T = np.zeros((n, n))
+    for u in nodes:
+        i = node_to_idx[u]
+        succs = list(graph.successors(u))
+        if succs:
+            for v in succs:
+                T[i, node_to_idx[v]] = 1.0 / len(succs)
+        else:
+            T[i, :] = 1.0 / n  # dangling node teleports uniformly
+
+    PR = damping * T + (1.0 - damping) / n  # PageRank transition matrix
+
+    pi_dict = nx.pagerank(graph, alpha=damping)
+    pi = np.array([pi_dict[v] for v in nodes])
+
+    if start_node is None:
+        start_node = nodes[0]
+    dist = np.zeros(n)
+    dist[node_to_idx[start_node]] = 1.0
+
+    tvd_series: List[float] = []
+    mixing_time = max_steps
+    for step in range(max_steps):
+        tvd = 0.5 * float(np.sum(np.abs(dist - pi)))
+        tvd_series.append(tvd)
+        if tvd < epsilon and mixing_time == max_steps:
+            mixing_time = step
+        dist = dist @ PR
+
+    return np.array(tvd_series), mixing_time
+
+
+# ─── Dynamics: SIR Epidemic ───────────────────────────────────────────────────
+
+def simulate_sir(
+    graph: nx.Graph,
+    beta: float,
+    gamma: float,
+    seed_node: int,
+    n_steps: int = 60,
+    seed: int = 42,
+) -> Dict[str, List[int]]:
+    """Discrete-time SIR epidemic on an undirected graph."""
+    rng = np.random.default_rng(seed)
+    nodes = list(graph.nodes())
+    n = len(nodes)
+    adj = {v: list(graph.neighbors(v)) for v in nodes}
+
+    state = {v: 0 for v in nodes}  # 0=S, 1=I, 2=R
+    state[seed_node] = 1
+
+    S_list, I_list, R_list = [n - 1], [1], [0]
+
+    for _ in range(n_steps):
+        new_I: set = set()
+        new_R: set = set()
+        for v in nodes:
+            if state[v] == 1:
+                for u in adj[v]:
+                    if state[u] == 0 and rng.random() < beta:
+                        new_I.add(u)
+                if rng.random() < gamma:
+                    new_R.add(v)
+        for v in new_I:
+            state[v] = 1
+        for v in new_R:
+            if state[v] == 1:
+                state[v] = 2
+
+        S = sum(1 for v in nodes if state[v] == 0)
+        I = sum(1 for v in nodes if state[v] == 1)
+        R = sum(1 for v in nodes if state[v] == 2)
+        S_list.append(S)
+        I_list.append(I)
+        R_list.append(R)
+        if I == 0:
+            for _ in range(n_steps - len(S_list) + 1):
+                S_list.append(S)
+                I_list.append(0)
+                R_list.append(R)
+            break
+
+    return {"S": S_list, "I": I_list, "R": R_list}
+
+
+# ─── Dynamics: Visualisation ──────────────────────────────────────────────────
+
+def plot_random_walk_frequency_map(
+    graph: nx.DiGraph,
+    n_steps: int = 200_000,
+    max_edges: int = 700,
+):
+    """Stacked maps of simulated visit frequency and PageRank."""
+    walk_freq = simulate_random_walk(graph, n_steps=n_steps)
+    pr = nx.pagerank(graph, alpha=0.85)
+
+    fig1 = _network_on_map(
+        graph,
+        title=f"Random Walk Visit Frequency ({n_steps:,} steps, restart p=0.15)",
+        max_edges=max_edges,
+        node_value=walk_freq,
+        colorbar_title="Visit Freq",
+        node_palette=Viridis256,
+        node_size=9,
+    )
+    fig2 = _network_on_map(
+        graph,
+        title="PageRank — Analytical Stationary Distribution",
+        max_edges=max_edges,
+        node_value=pr,
+        colorbar_title="PageRank",
+        node_palette=Viridis256,
+        node_size=9,
+    )
+    return column(fig1, fig2)
+
+
+def plot_mixing_time_convergence(
+    graph: nx.DiGraph,
+    damping: float = 0.85,
+    epsilon: float = 0.05,
+    max_steps: int = 20,
+):
+    """TVD to stationary vs step, for three different starting nodes."""
+    nodes = list(graph.nodes())
+    n = len(nodes)
+    degrees_out = dict(graph.out_degree())
+    sorted_by_out = sorted(nodes, key=lambda v: degrees_out[v])
+
+    start_configs = [
+        ("Highest out-degree", sorted_by_out[-1], "#d62728"),
+        ("Median out-degree", sorted_by_out[n // 2], "#1f77b4"),
+        ("Lowest out-degree", sorted_by_out[0], "#2ca02c"),
+    ]
+
+    fig = figure(
+        title="Random Walk Convergence: TVD to Stationary Distribution",
+        width=950,
+        height=420,
+        tools="pan,wheel_zoom,box_zoom,save,reset",
+    )
+    max_len = 0
+    for label, node, color in start_configs:
+        tvd, mt = compute_mixing_time_tvd(
+            graph, start_node=node, damping=damping, epsilon=epsilon, max_steps=max_steps
+        )
+        name = graph.nodes[node].get("name", str(node))
+        steps = list(range(len(tvd)))
+        max_len = max(max_len, len(tvd))
+        fig.line(
+            steps,
+            tvd.tolist(),
+            color=color,
+            line_width=2.5,
+            legend_label=f"{label} — {name} (mixes at step {mt})",
+        )
+
+    fig.line(
+        [0, max_len - 1],
+        [epsilon, epsilon],
+        line_dash="dashed",
+        color="black",
+        line_width=1.5,
+        legend_label=f"ε = {epsilon}",
+    )
+    fig.xaxis.axis_label = "Step"
+    fig.yaxis.axis_label = "Total Variation Distance"
+    fig.legend.location = "top_right"
+    fig.legend.click_policy = "hide"
+    return fig
+
+
+def plot_sir_epidemics(
+    graph: nx.Graph,
+    beta: float = 0.003,
+    gamma: float = 0.10,
+    n_steps: int = 60,
+    seed: int = 42,
+):
+    """SIR epidemic curves starting from the top hub, a median, and the most peripheral node."""
+    nodes = list(graph.nodes())
+    n = len(nodes)
+    degrees = dict(graph.degree())
+    sorted_by_deg = sorted(nodes, key=lambda v: degrees[v])
+
+    configs = [
+        (sorted_by_deg[-1], "#d62728"),
+        (sorted_by_deg[n // 2], "#1f77b4"),
+        (sorted_by_deg[0], "#2ca02c"),
+    ]
+
+    steps = list(range(n_steps + 1))
+
+    fig_i = figure(
+        title=f"SIR Epidemic — Infected fraction  (β={beta}, γ={gamma})",
+        width=950,
+        height=400,
+        tools="pan,wheel_zoom,box_zoom,save,reset",
+    )
+    fig_r = figure(
+        title=f"SIR Epidemic — Recovered fraction  (β={beta}, γ={gamma})",
+        width=950,
+        height=400,
+        tools="pan,wheel_zoom,box_zoom,save,reset",
+    )
+
+    for node, color in configs:
+        name = graph.nodes[node].get("name", str(node))
+        k = degrees[node]
+        label = f"{name} (k={k})"
+        res = simulate_sir(graph, beta=beta, gamma=gamma, seed_node=node, n_steps=n_steps, seed=seed)
+        i_frac = [v / n for v in res["I"]]
+        r_frac = [v / n for v in res["R"]]
+        xs = steps[: len(i_frac)]
+        fig_i.line(xs, i_frac, color=color, line_width=2.5, legend_label=label)
+        fig_r.line(steps[: len(r_frac)], r_frac, color=color, line_width=2.5, legend_label=label)
+
+    for f in (fig_i, fig_r):
+        f.xaxis.axis_label = "Time Step"
+        f.yaxis.axis_label = "Fraction of Population"
+        f.legend.location = "top_right"
+        f.legend.click_policy = "hide"
+
+    return column(fig_i, fig_r)
+
+
 def run_pipeline(config: AirportDatasetConfig):
     """High-level helper that returns all core objects used in the notebook."""
     nodes_df, edges_df = load_airport_data(config)
