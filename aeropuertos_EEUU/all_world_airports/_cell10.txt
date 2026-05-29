@@ -1,0 +1,133 @@
+import importlib
+
+importlib.reload(utils)
+
+from utils import (
+    louvain_communities_map_plot,
+    plot_louvain_coassignment_heatmaps_pair,
+    plot_louvain_community_mean_degrees,
+    plot_louvain_community_node_counts,
+    plot_louvain_modularity_trajectory,
+    louvain_reference_partition,
+    louvain_pre_final_communities_map_plot,
+    louvain_modularity_by_level,
+)
+
+N_LOUVAIN_RUNS = 40
+LOUVAIN_SEED = 42
+HEATMAP_SAMPLE_SEED = 2024
+MAX_HEATMAP_NODES = 40
+
+# Reference partition (shared by map, heatmap order, bar colors, hover labels)
+ref_communities, ref_modularity, ref_membership = louvain_reference_partition(
+    G_undirected,
+    seed=LOUVAIN_SEED,
+)
+
+# All airports per Louvain community (final partition)
+print("Louvain communities (final partition) - airports per community:")
+for comm_id, community in enumerate(ref_communities, start=1):
+    airport_names = sorted(
+        G_undirected.nodes[n].get("name", str(n)) for n in community
+    )
+    print(f"\nCommunity {comm_id} ({len(airport_names)} airports):")
+    for name in airport_names:
+        print(f"  - {name}")
+
+# 0) Community map — use this to read Community 1, 2, … in the bar chart
+map_fig, _, _, _ = louvain_communities_map_plot(
+    G_undirected,
+    communities=ref_communities,
+    modularity_score=ref_modularity,
+    seed=LOUVAIN_SEED,
+    max_edges=900,
+)
+show(map_fig)
+print(f"Reference Louvain modularity (final): {ref_modularity:.4f}")
+
+
+# 1) Co-assignment heatmaps side by side (hover highlights row/column)
+co_layout, co_matrices, co_label_groups, co_selected = plot_louvain_coassignment_heatmaps_pair(
+    G_undirected,
+    communities=ref_communities,
+    membership=ref_membership,
+    n_runs=N_LOUVAIN_RUNS,
+    seed=LOUVAIN_SEED,
+    max_nodes=MAX_HEATMAP_NODES,
+    heatmap_sample_seed=HEATMAP_SAMPLE_SEED,
+)
+show(co_layout)
+print(
+    f"Left: {len(co_label_groups[0])} random high-degree airports | "
+    f"Right: {len(co_label_groups[1])} balanced per community "
+    f"({G_undirected.number_of_nodes()} nodes in graph)."
+)
+
+
+# 1b) Co-assignment heatmaps side by side without node limit
+co_layout, co_matrices, co_label_groups, co_selected = plot_louvain_coassignment_heatmaps_pair(
+    G_undirected,
+    communities=ref_communities,
+    membership=ref_membership,
+    n_runs=N_LOUVAIN_RUNS,
+    seed=LOUVAIN_SEED,
+    max_nodes=10000,
+    heatmap_sample_seed=HEATMAP_SAMPLE_SEED,
+)
+show(co_layout)
+print(
+    f"Left: {len(co_label_groups[0])} random high-degree airports | "
+    f"Right: {len(co_label_groups[1])} balanced per community "
+    f"({G_undirected.number_of_nodes()} nodes in graph)."
+)
+
+# 2) Mean weighted degree and node counts per community (same partition as map)
+deg_fig, community_degrees = plot_louvain_community_mean_degrees(
+    G_undirected,
+    communities=ref_communities,
+)
+size_fig, _ = plot_louvain_community_node_counts(
+    G_undirected,
+    communities=ref_communities,
+)
+show(deg_fig)
+show(size_fig)
+display(community_degrees)
+
+# 3) Modularity path: level 0 singletons (worst Q) → merges → final level (used)
+mod_fig, modularity_path = plot_louvain_modularity_trajectory(
+    G_undirected,
+    seed=LOUVAIN_SEED,
+)
+show(mod_fig)
+display(modularity_path)
+final_q = modularity_path.loc[
+    modularity_path["stage"] == "final (chosen partition)", "modularity"
+].iloc[0]
+pre_final_q = modularity_path.loc[
+    modularity_path["stage"].str.contains("pre-final", na=False), "modularity"
+]
+
+print("Louvain communities (final partition) — airports:")
+for i, community in enumerate(ref_communities, start=1):
+    airports = sorted(
+        G_undirected.nodes[node].get("name", str(node)) for node in community
+    )
+    print(f"\nCommunity {i} ({len(airports)} airports):")
+    print(", ".join(airports))
+
+print(
+    f"\nInitial Q (singletons): {modularity_path.iloc[0]['modularity']:.4f} | "
+    f"Pre-final Q: {pre_final_q.iloc[0]:.4f} | "
+    f"Final Q (chosen): {final_q:.4f}"
+)
+
+
+# 0b) Pre-final hierarchical level (partition before the chosen final)
+pre_final_fig, pre_final_modularity, _ = louvain_pre_final_communities_map_plot(
+    G_undirected,
+    seed=LOUVAIN_SEED,
+    max_edges=900,     
+)
+show(pre_final_fig)
+print(f"Pre-final level modularity: {pre_final_modularity:.4f}")

@@ -527,6 +527,475 @@ def _network_on_map(
     return plot
 
 
+# === world ariports utils ===
+
+def _layout_positions(graph: nx.Graph, seed: int = 42) -> Dict[int, Tuple[float, float]]:
+    return nx.spring_layout(graph, seed=seed)
+
+
+def _base_layout_figure(title: str, pos: Dict[int, Tuple[float, float]]):
+    x_vals = [xy[0] for xy in pos.values()]
+    y_vals = [xy[1] for xy in pos.values()]
+    pad_x = (max(x_vals) - min(x_vals)) * 0.08 if x_vals else 1.0
+    pad_y = (max(y_vals) - min(y_vals)) * 0.08 if y_vals else 1.0
+
+    plot = figure(
+        title=title,
+        tools="pan,wheel_zoom,box_zoom,save,reset,tap",
+        active_scroll="wheel_zoom",
+        x_range=(min(x_vals) - pad_x, max(x_vals) + pad_x) if x_vals else (-1, 1),
+        y_range=(min(y_vals) - pad_y, max(y_vals) + pad_y) if y_vals else (-1, 1),
+        width=900,
+        height=600,
+    )
+    plot.axis.visible = False
+    plot.grid.visible = False
+    return plot
+
+
+def _network_on_layout(
+    graph: nx.Graph,
+    title: str,
+    max_edges: int = 2000,
+    node_size: int = 8,
+    node_value: Dict[int, float] | None = None,
+    roles: Dict[int, str] | None = None,
+    colorbar_title: str = "Value",
+    node_palette=Turbo256,
+    categorical_coloring: bool = False,
+    seed: int = 42,
+):
+    sampled = _subsample_graph_edges(graph, max_edges=max_edges)
+    _prepare_node_attributes(sampled, graph, values=node_value, roles=roles)
+
+    pos = _layout_positions(sampled, seed=seed)
+    plot = _base_layout_figure(title, pos)
+
+    network_graph = from_networkx(sampled, pos)
+    network_graph.node_renderer.data_source.data["size_base"] = [node_size for _ in sampled.nodes()]
+    network_graph.node_renderer.data_source.data["size"] = [node_size for _ in sampled.nodes()]
+
+    if categorical_coloring and roles is not None:
+        network_graph.node_renderer.glyph = Scatter(
+            size="size",
+            marker="circle",
+            fill_color=factor_cmap("role", palette=_CENTER_PERIPHERY_PALETTE, factors=_CENTER_PERIPHERY_FACTORS),
+            line_color="white",
+            fill_alpha=0.9,
+        )
+        _add_categorical_legend(plot, _CENTER_PERIPHERY_LABELS, _CENTER_PERIPHERY_PALETTE, node_size)
+    elif node_value is None:
+        network_graph.node_renderer.glyph = Scatter(
+            size="size",
+            marker="circle",
+            fill_color="#1f77b4",
+            line_color="white",
+            fill_alpha=0.9,
+        )
+    else:
+        vals = [float(v) for v in node_value.values()]
+        low, high = min(vals), max(vals)
+        if np.isclose(low, high):
+            high = low + 1.0
+        mapper = LinearColorMapper(palette=node_palette, low=low, high=high)
+        network_graph.node_renderer.glyph = Scatter(
+            size="size",
+            marker="circle",
+            fill_color={"field": "value", "transform": mapper},
+            line_color="white",
+            fill_alpha=0.9,
+        )
+        color_bar = ColorBar(color_mapper=mapper, ticker=BasicTicker(), label_standoff=8, title=colorbar_title)
+        plot.add_layout(color_bar, "right")
+
+    network_graph.edge_renderer.glyph = MultiLine(line_alpha=0.12, line_width=1.0, line_color="gray")
+    network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+    network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+
+    plot.renderers.append(network_graph)
+    _attach_incident_edge_highlighting(plot, network_graph, pos)
+    _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=node_size)
+    return plot
+
+def load_world_edge_list(edges_path: str | Path, comment_prefix: str = "%") -> pd.DataFrame:
+    """Load world edge list with source/target columns."""
+    edges_df = pd.read_csv(
+        edges_path,
+        comment=comment_prefix,
+        sep=r"\s+",
+        header=None,
+        names=["source", "target"],
+    )
+    return edges_df.astype({"source": int, "target": int})
+
+
+def build_world_graphs(edges_df: pd.DataFrame) -> Tuple[nx.DiGraph, nx.Graph]:
+    """Build directed and undirected world graphs (undirected if any directed edge exists)."""
+    directed = nx.DiGraph()
+    directed.add_edges_from((int(s), int(t)) for s, t in edges_df[["source", "target"]].itertuples(index=False, name=None))
+
+    for node in directed.nodes():
+        directed.nodes[node]["name"] = str(node)
+
+    undirected = nx.Graph()
+    undirected.add_nodes_from(directed.nodes(data=True))
+    undirected.add_edges_from({tuple(sorted((u, v))) for u, v in directed.edges() if u != v})
+
+    return directed, undirected
+
+
+def plot_world_force_layout(graph: nx.Graph, max_edges: int = 2000, seed: int = 42):
+    """Plot a force-directed layout for the world graph (edge sampling supported)."""
+    edge_list = list(graph.edges())
+    if len(edge_list) > max_edges:
+        rng = np.random.default_rng(seed)
+        sampled_idx = rng.choice(len(edge_list), size=max_edges, replace=False)
+        sampled_edges = [edge_list[i] for i in sampled_idx]
+        sampled_graph = nx.Graph()
+        sampled_graph.add_nodes_from(graph.nodes(data=True))
+        sampled_graph.add_edges_from(sampled_edges)
+    else:
+        sampled_graph = graph
+
+    pos = nx.spring_layout(sampled_graph, seed=seed)
+    plot = figure(title="World Airports - Force-Directed Layout (sampled)", width=900, height=600)
+    plot.axis.visible = False
+    plot.grid.visible = False
+
+    plot_graph = from_networkx(sampled_graph, pos)
+    plot_graph.node_renderer.glyph = Circle(size=6, fill_color="#1f77b4", line_color="white", fill_alpha=0.8)
+    plot_graph.edge_renderer.glyph = MultiLine(line_alpha=0.15, line_width=1.0, line_color="#888888")
+    plot.renderers.append(plot_graph)
+    return plot
+
+
+def plot_world_directed_overview(graph: nx.DiGraph, max_edges: int = 2000, seed: int = 42):
+    return _network_on_layout(
+        graph,
+        title=f"World Directed Graph (Nodes={graph.number_of_nodes()}, Edges={graph.number_of_edges()})",
+        max_edges=max_edges,
+        node_size=8,
+        seed=seed,
+    )
+
+
+def plot_world_undirected_overview(graph: nx.Graph, max_edges: int = 2000, seed: int = 42):
+    return _network_on_layout(
+        graph,
+        title=f"World Undirected Graph (Nodes={graph.number_of_nodes()}, Edges={graph.number_of_edges()})",
+        max_edges=max_edges,
+        node_size=8,
+        seed=seed,
+    )
+
+
+def plot_world_local_clustering(graph: nx.Graph, max_edges: int = 2000, seed: int = 42):
+    coeff = nx.clustering(graph)
+    return _network_on_layout(
+        graph,
+        title="Local Clustering Coefficient (World)",
+        max_edges=max_edges,
+        node_value=coeff,
+        colorbar_title="Clustering",
+        node_palette=Viridis256,
+        node_size=8,
+        seed=seed,
+    )
+
+
+def plot_world_center_periphery(graph: nx.Graph, max_edges: int = 2000, seed: int = 42):
+    components = list(nx.connected_components(graph))
+    if not components:
+        raise ValueError("The world graph has no connected components.")
+
+    largest_cc = max(components, key=len)
+    g_lcc = graph.subgraph(largest_cc).copy()
+
+    center_nodes = set(nx.center(g_lcc))
+    periphery_nodes = set(nx.periphery(g_lcc))
+
+    roles = {}
+    for n in g_lcc.nodes():
+        if n in center_nodes:
+            roles[n] = "center"
+        elif n in periphery_nodes:
+            roles[n] = "periphery"
+        else:
+            roles[n] = "other"
+
+    sampled = _subsample_graph_edges(g_lcc, max_edges=max_edges)
+    _prepare_node_attributes(sampled, g_lcc, roles=roles)
+
+    pos = _layout_positions(sampled, seed=seed)
+    plot = _base_layout_figure("Center, Periphery, and Other — Largest Connected Component", pos)
+
+    network_graph = from_networkx(sampled, pos)
+    network_graph.node_renderer.data_source.data["size_base"] = [8 for _ in sampled.nodes()]
+    network_graph.node_renderer.data_source.data["size"] = [8 for _ in sampled.nodes()]
+    network_graph.node_renderer.glyph = Scatter(
+        size="size",
+        marker="circle",
+        fill_color=factor_cmap("role", palette=_CENTER_PERIPHERY_PALETTE, factors=_CENTER_PERIPHERY_FACTORS),
+        line_color="white",
+        fill_alpha=0.9,
+    )
+    _add_categorical_legend(plot, _CENTER_PERIPHERY_LABELS, _CENTER_PERIPHERY_PALETTE, 8)
+
+    network_graph.edge_renderer.glyph = MultiLine(line_alpha=0.12, line_width=1.0, line_color="gray")
+    network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+    network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+
+    plot.renderers.append(network_graph)
+    _attach_incident_edge_highlighting(plot, network_graph, pos)
+    _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=8)
+
+    center_x = [pos[n][0] for n in sampled.nodes() if roles.get(n) == "center"]
+    center_y = [pos[n][1] for n in sampled.nodes() if roles.get(n) == "center"]
+    periphery_x = [pos[n][0] for n in sampled.nodes() if roles.get(n) == "periphery"]
+    periphery_y = [pos[n][1] for n in sampled.nodes() if roles.get(n) == "periphery"]
+
+    if center_x:
+        plot.scatter(
+            center_x,
+            center_y,
+            size=12,
+            fill_color=_CENTER_PERIPHERY_PALETTE[0],
+            line_color="black",
+            line_width=0.8,
+            fill_alpha=1.0,
+        )
+    if periphery_x:
+        plot.scatter(
+            periphery_x,
+            periphery_y,
+            size=12,
+            fill_color=_CENTER_PERIPHERY_PALETTE[1],
+            line_color="black",
+            line_width=0.8,
+            fill_alpha=1.0,
+        )
+
+    return plot
+
+
+def _plot_world_components(
+    graph: nx.Graph,
+    components: List[set],
+    title: str,
+    max_edges: int = 2000,
+    seed: int = 42,
+):
+    membership: Dict[int, str] = {}
+    for index, component in enumerate(components, start=1):
+        label = f"Component {index}"
+        for node in component:
+            membership[node] = label
+
+    sampled = _subsample_graph_edges(graph, max_edges=max_edges)
+    _prepare_node_attributes(sampled, graph, roles={n: membership.get(n, "Component ?") for n in sampled.nodes()})
+
+    pos = _layout_positions(sampled, seed=seed)
+    plot = _base_layout_figure(title, pos)
+    network_graph = from_networkx(sampled, pos)
+
+    labels = [membership.get(node, "Component ?") for node in sampled.nodes()]
+    factors = sorted(set(labels))
+    palette = _community_palette(len(factors))
+    color_map = {f: palette[i % len(palette)] for i, f in enumerate(factors)}
+    colors = [color_map[l] for l in labels]
+
+    node_source = network_graph.node_renderer.data_source
+    node_source.data["role"] = labels
+    node_source.data["color"] = colors
+    node_source.data["size_base"] = [8 for _ in sampled.nodes()]
+    node_source.data["size"] = [8 for _ in sampled.nodes()]
+
+    network_graph.node_renderer.glyph = Scatter(
+        size="size",
+        marker="circle",
+        fill_color="color",
+        line_color="white",
+        fill_alpha=0.9,
+    )
+    network_graph.edge_renderer.glyph = MultiLine(line_alpha=0.12, line_width=1.0, line_color="gray")
+    network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+    network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+
+    plot.renderers.append(network_graph)
+    _attach_incident_edge_highlighting(plot, network_graph, pos)
+    _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=8)
+
+    legend_factors = sorted(
+        factors,
+        key=lambda label: int(label.split()[-1]) if label.startswith("Component ") and label.split()[-1].isdigit() else label,
+    )
+    legend_colors = [color_map[label] for label in legend_factors]
+    _add_categorical_legend(plot, legend_factors, legend_colors, 8)
+    return plot
+
+
+def plot_world_directed_components(
+    graph: nx.DiGraph,
+    max_edges: int = 2000,
+    seed: int = 42,
+    weak: bool = True,
+):
+    if weak:
+        components = list(nx.weakly_connected_components(graph))
+        title = "World Directed Graph Components (Weakly Connected)"
+    else:
+        components = list(nx.strongly_connected_components(graph))
+        title = "World Directed Graph Components (Strongly Connected)"
+    return _plot_world_components(graph, components, title, max_edges=max_edges, seed=seed)
+
+
+def plot_world_undirected_components(graph: nx.Graph, max_edges: int = 2000, seed: int = 42):
+    components = list(nx.connected_components(graph))
+    title = "World Undirected Graph Components"
+    return _plot_world_components(graph, components, title, max_edges=max_edges, seed=seed)
+
+
+def plot_world_louvain_communities(graph: nx.Graph, max_edges: int = 2000, seed: int = 42):
+    communities = louvain_communities(graph, seed=seed, weight="weight")
+    membership = _communities_to_mapping(communities)
+    sampled = _subsample_graph_edges(graph, max_edges=max_edges)
+    _prepare_node_attributes(sampled, graph, roles={n: membership.get(n, "Community 0") for n in sampled.nodes()})
+
+    pos = _layout_positions(sampled, seed=seed)
+    plot = _base_layout_figure("Louvain Communities (World)", pos)
+    network_graph = from_networkx(sampled, pos)
+
+    labels = [membership.get(node, "Community 0") for node in sampled.nodes()]
+    factors = sorted(set(labels))
+    palette = _community_palette(len(factors))
+    color_map = {f: palette[i % len(palette)] for i, f in enumerate(factors)}
+    colors = [color_map[l] for l in labels]
+
+    node_source = network_graph.node_renderer.data_source
+    node_source.data["role"] = labels
+    node_source.data["color"] = colors
+    node_source.data["size_base"] = [8 for _ in sampled.nodes()]
+    node_source.data["size"] = [8 for _ in sampled.nodes()]
+
+    network_graph.node_renderer.glyph = Scatter(
+        size="size",
+        marker="circle",
+        fill_color="color",
+        line_color="white",
+        fill_alpha=0.9,
+    )
+    network_graph.edge_renderer.glyph = MultiLine(line_alpha=0.12, line_width=1.0, line_color="gray")
+    network_graph.edge_renderer.hover_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+    network_graph.edge_renderer.selection_glyph = MultiLine(line_alpha=0.95, line_width=4.0, line_color="#111111")
+
+    plot.renderers.append(network_graph)
+    _attach_incident_edge_highlighting(plot, network_graph, pos)
+    _attach_zoom_scaling(plot, network_graph.node_renderer.data_source, base_size=8)
+    legend_factors = sorted(
+        factors,
+        key=lambda label: int(label.split()[-1]) if label.startswith("Community ") and label.split()[-1].isdigit() else label,
+    )
+    legend_colors = [color_map[label] for label in legend_factors]
+    _add_categorical_legend(plot, legend_factors, legend_colors, 8)
+    return plot
+
+
+def compute_world_centralities(graph: nx.Graph) -> pd.DataFrame:
+    """Compute centrality measures for the world graph."""
+    centralities = compute_centralities(graph)
+    return pd.DataFrame(centralities)
+
+
+def top_centrality_nodes(centrality_df: pd.DataFrame, top_n: int = 10) -> Dict[str, pd.Series]:
+    """Return the top-N nodes per centrality column."""
+    return {col: centrality_df[col].sort_values(ascending=False).head(top_n) for col in centrality_df.columns}
+
+
+def plot_world_degree_histogram(graph: nx.Graph, bins: int = 30):
+    """Plot the degree histogram for the world graph."""
+    degrees = np.array([d for _, d in graph.degree()])
+    hist, edges = np.histogram(degrees, bins=bins)
+
+    fig = figure(
+        title="World Graph Degree Histogram",
+        width=750,
+        height=450,
+        tools="pan,wheel_zoom,box_zoom,save,reset",
+    )
+    fig.quad(top=hist, bottom=0, left=edges[:-1], right=edges[1:], fill_color="#1f77b4", line_color="white", alpha=0.85)
+    fig.xaxis.axis_label = "Degree"
+    fig.yaxis.axis_label = "Count"
+    return fig
+
+
+def plot_world_clustering_histogram(graph: nx.Graph, bins: int = 30) -> Tuple[figure, float]:
+    """Plot clustering coefficient distribution and return the average value."""
+    clustering = np.array(list(nx.clustering(graph).values()))
+    hist, edges = np.histogram(clustering, bins=bins, range=(0.0, 1.0))
+
+    fig = figure(
+        title="Local Clustering Coefficient Distribution",
+        width=750,
+        height=450,
+        tools="pan,wheel_zoom,box_zoom,save,reset",
+    )
+    fig.quad(top=hist, bottom=0, left=edges[:-1], right=edges[1:], fill_color="#2ca02c", line_color="white", alpha=0.85)
+    fig.xaxis.axis_label = "Clustering Coefficient"
+    fig.yaxis.axis_label = "Count"
+    return fig, float(clustering.mean()) if clustering.size else 0.0
+
+
+def compute_world_center_periphery(graph: nx.Graph) -> Dict[str, object]:
+    """Compute center/periphery stats on the largest connected component."""
+    components = list(nx.connected_components(graph))
+    if not components:
+        raise ValueError("The world graph has no connected components.")
+
+    largest_cc = max(components, key=len)
+    g_lcc = graph.subgraph(largest_cc).copy()
+    eccentricity = nx.eccentricity(g_lcc)
+    radius = min(eccentricity.values())
+    diameter = max(eccentricity.values())
+    center_nodes = [n for n, e in eccentricity.items() if e == radius]
+    periphery_nodes = [n for n, e in eccentricity.items() if e == diameter]
+
+    return {
+        "lcc_nodes": g_lcc.number_of_nodes(),
+        "lcc_edges": g_lcc.number_of_edges(),
+        "radius": radius,
+        "diameter": diameter,
+        "center_nodes": center_nodes,
+        "periphery_nodes": periphery_nodes,
+    }
+
+
+def plot_world_degree_distribution_loglog(graph: nx.Graph):
+    """Plot degree distribution in log-log scale for the world graph."""
+    return plot_degree_distribution_loglog(graph, add_fit=False)
+
+
+def louvain_world_coassignment(
+    graph: nx.Graph,
+    n_runs: int = 40,
+    seed: int = 42,
+    max_nodes: int = 40,
+    heatmap_sample_seed: int = 2024,
+) -> Tuple[List[set], float, object, List[List[str]]]:
+    """Run Louvain and return communities, modularity, and co-assignment heatmap layout."""
+    communities, modularity_score, membership = louvain_reference_partition(graph, seed=seed)
+    co_layout, _, co_label_groups, _ = plot_louvain_coassignment_heatmaps_pair(
+        graph,
+        communities=communities,
+        membership=membership,
+        n_runs=n_runs,
+        seed=seed,
+        max_nodes=max_nodes,
+        heatmap_sample_seed=heatmap_sample_seed,
+    )
+    return communities, modularity_score, co_layout, co_label_groups
+
+#### END WORLD AIRPORTS UTILS
+
 def plot_all_connections(graph: nx.DiGraph, max_edges: int = 300):
     return _network_on_map(
         graph,
